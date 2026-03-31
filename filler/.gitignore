@@ -1,0 +1,17 @@
+# Build output
+/target/
+
+# Dependency lock is checked in for binaries, but exclude large cache artifacts
+# (keep Cargo.lock — it's a binary crate)
+
+# Environment — never commit secrets
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
