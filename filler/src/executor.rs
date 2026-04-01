@@ -8,7 +8,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use anyhow::Result;
 use std::str::FromStr;
-use tracing::info;
+use tracing::{debug, error, info};
 
 alloy::sol! {
     #[sol(rpc)]
@@ -30,7 +30,16 @@ alloy::sol! {
 /// Builds `callbackData` as `abi.encode(bytes[] swapPaths)`, constructs the
 /// `SignedOrder`, and calls `FillerExecutor.execute()` on-chain.
 pub async fn fill(intent: FillIntent, config: &Config) -> Result<()> {
-    // Build a signing provider from the configured private key
+    info!(
+        hash = %intent.order.order_hash,
+        input_token = %intent.order.input.token,
+        output_token = %intent.order.outputs[0].token,
+        input_amount = %intent.input_amount,
+        output_amount = %intent.output_amount,
+        executor = %config.executor_address,
+        "building fill transaction"
+    );
+
     let signer: PrivateKeySigner = config.private_key.parse()?;
     let wallet = EthereumWallet::from(signer);
     let provider = ProviderBuilder::new()
@@ -45,7 +54,15 @@ pub async fn fill(intent: FillIntent, config: &Config) -> Result<()> {
         intent.order.signature.trim_start_matches("0x"),
     )?);
 
-    // callbackData: abi.encode(bytes[] swapPaths) — one path, matches the single order
+    debug!(
+        hash = %intent.order.order_hash,
+        order_bytes = order_bytes.len(),
+        sig_bytes = sig_bytes.len(),
+        swap_path = %hex::encode(&intent.swap_path),
+        "encoded order and callback data"
+    );
+
+    // callbackData: abi.encode(bytes[] swapPaths) — one path per order
     let swap_paths: Vec<Bytes> = vec![Bytes::from(intent.swap_path)];
     let callback_data = Bytes::from(swap_paths.abi_encode());
 
@@ -57,23 +74,40 @@ pub async fn fill(intent: FillIntent, config: &Config) -> Result<()> {
         sig: sig_bytes,
     };
 
-    // Submit — with_recommended_fillers handles nonce, gas estimation, and chain ID
+    info!(hash = %intent.order.order_hash, "submitting fill tx");
+
     let pending = executor
         .execute(signed_order, callback_data)
         .send()
         .await?;
 
     let tx_hash = *pending.tx_hash();
-    info!(order = %intent.order.order_hash, tx = %tx_hash, "fill submitted");
+    info!(
+        hash = %intent.order.order_hash,
+        tx = %tx_hash,
+        "fill tx submitted — waiting for confirmation"
+    );
 
     let receipt = pending.get_receipt().await?;
-    info!(
-        order = %intent.order.order_hash,
-        tx = %tx_hash,
-        block = ?receipt.block_number,
-        status = ?receipt.status(),
-        "fill confirmed"
-    );
+    let success = receipt.status();
+
+    if success {
+        info!(
+            hash = %intent.order.order_hash,
+            tx = %tx_hash,
+            block = ?receipt.block_number,
+            gas_used = ?receipt.gas_used,
+            "fill confirmed ✓"
+        );
+    } else {
+        error!(
+            hash = %intent.order.order_hash,
+            tx = %tx_hash,
+            block = ?receipt.block_number,
+            gas_used = ?receipt.gas_used,
+            "fill reverted ✗"
+        );
+    }
 
     Ok(())
 }

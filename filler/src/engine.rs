@@ -1,11 +1,10 @@
 use crate::config::Config;
 use crate::types::Order;
-use alloy::primitives::{Address, U256, aliases::U24};
-use alloy::primitives::Uint;
+use alloy::primitives::{aliases::U24, Address, Uint, U256};
 use alloy::providers::Provider;
 use anyhow::Result;
 use std::str::FromStr;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 alloy::sol! {
     #[sol(rpc)]
@@ -47,17 +46,15 @@ pub async fn evaluate<P: Provider>(
     config: &Config,
     provider: &P,
 ) -> Result<Option<FillIntent>> {
-    // Parse token addresses
     let token_in = Address::from_str(&order.input.token)?;
     let token_out = Address::from_str(&order.outputs[0].token)?;
 
-    // Use end_amount as the resolved amount — conservative approximation
-    // (maximum input / minimum output for the filler). Full nonlinear decay
-    // resolution against current block number will replace this in a later iteration.
+    // Use end_amount as the resolved amount — conservative approximation.
+    // Full nonlinear decay resolution against current block will replace this later.
     let input_amount = U256::from_str(&order.input.end_amount)?;
     let required_output = U256::from_str(&order.outputs[0].end_amount)?;
 
-    debug!(
+    info!(
         hash = %order.order_hash,
         token_in = %token_in,
         token_out = %token_out,
@@ -66,7 +63,13 @@ pub async fn evaluate<P: Provider>(
         "evaluating order"
     );
 
-    // Query the V3 Quoter for how much tokenOut we get for tokenIn at this pool
+    // Query the V3 Quoter
+    debug!(
+        hash = %order.order_hash,
+        pool_fee = config.pool_fee,
+        "calling QuoterV2"
+    );
+
     let quoted_output = match quote(provider, token_in, token_out, input_amount, config.pool_fee).await {
         Ok(amount) => amount,
         Err(e) => {
@@ -75,22 +78,31 @@ pub async fn evaluate<P: Provider>(
         }
     };
 
-    debug!(
+    let profit = quoted_output.saturating_sub(required_output);
+    let min_profit = U256::from(config.min_profit_wei);
+
+    info!(
         hash = %order.order_hash,
-        quoted = %quoted_output,
-        required = %required_output,
-        "quote received"
+        quoted_output = %quoted_output,
+        required_output = %required_output,
+        profit = %profit,
+        min_profit = %min_profit,
+        profitable = %(profit >= min_profit),
+        "quote result"
     );
 
-    // Check profit margin
-    let profit = quoted_output.saturating_sub(required_output);
-    if profit < U256::from(config.min_profit_wei) {
-        debug!(hash = %order.order_hash, profit = %profit, "insufficient profit, skipping");
+    if profit < min_profit {
+        debug!(hash = %order.order_hash, "insufficient profit, skipping");
         return Ok(None);
     }
 
-    // Build V3 swap path: abi.encodePacked(tokenIn, fee_as_uint24, tokenOut)
     let swap_path = build_swap_path(token_in, config.pool_fee, token_out);
+
+    info!(
+        hash = %order.order_hash,
+        profit = %profit,
+        "order profitable — creating fill intent"
+    );
 
     Ok(Some(FillIntent {
         order: order.clone(),
